@@ -1,0 +1,46 @@
+name: Compiler l'app
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Installer XcodeGen
+        run: brew install xcodegen
+
+      - name: Générer le projet Xcode
+        run: xcodegen generate
+
+      - name: Compiler
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project SwipeVideos.xcodeproj \
+            -scheme SwipeVideos \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Créer le fichier .ipa
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/SwipeVideos.app Payload/
+          zip -qry SwipeVideos.ipa Payload
+
+      - name: Mettre l'app à disposition
+        uses: actions/upload-artifact@v4
+        with:
+          name: SwipeVideos-ipa
+          path: SwipeVideos.ipa
