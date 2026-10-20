@@ -5,13 +5,19 @@ import SwiftUI
 let videoExtensions: Set<String> = ["mp4", "m4v", "mov", "3gp"]
 
 struct VideoItem: Identifiable, Hashable {
-    let path: String            // chemin relatif au dossier choisi
+    let path: String            // dossier : chemin relatif ; fichiers : identifiant unique
+    let label: String           // nom du fichier
     var id: String { path }
-    var name: String { ((path as NSString).lastPathComponent as NSString).deletingPathExtension }
-    var folder: String { (path as NSString).deletingLastPathComponent }
+    var name: String { (label as NSString).deletingPathExtension }
+    var folder: String { (path as NSString).deletingLastPathComponent.hasPrefix("§") ? "" : (path as NSString).deletingLastPathComponent }
+
+    init(path: String) { self.path = path; self.label = (path as NSString).lastPathComponent }
+    init(fileId: String, label: String) { self.path = fileId; self.label = label }
 }
 
-/// Liste des vidéos du dossier choisi : mémorisée, puis vérifiée en arrière-plan
+/// Deux façons d'ajouter des vidéos :
+/// - un dossier (emplacements Apple : Sur mon iPhone, iCloud Drive), sous-dossiers inclus ;
+/// - des fichiers choisis un par un (Cryptomator, OneDrive… qui ne permettent pas de choisir un dossier).
 @MainActor
 final class Library: ObservableObject {
     @Published private(set) var rootURL: URL?
@@ -24,8 +30,12 @@ final class Library: ObservableObject {
         didSet { UserDefaults.standard.set(shuffle, forKey: "shuffle") }
     }
 
-    private var allPaths: [String] = []
+    private var allItems: [VideoItem] = []
+    private var fileURLs: [String: URL] = [:]       // vidéos choisies une par une
+    private var fileBookmarks: [String: Data] = [:]
     private var scanTask: Task<Void, Never>?
+
+    var hasSource: Bool { rootURL != nil || !fileURLs.isEmpty }
 
     init() {
         shuffle = UserDefaults.standard.bool(forKey: "shuffle")
@@ -33,7 +43,8 @@ final class Library: ObservableObject {
     }
 
     func url(for item: VideoItem) -> URL? {
-        rootURL?.appendingPathComponent(item.path)
+        if let u = fileURLs[item.id] { return u }
+        return rootURL?.appendingPathComponent(item.path)
     }
 
     var currentIndex: Int {
@@ -41,28 +52,92 @@ final class Library: ObservableObject {
         return items.firstIndex(where: { $0.id == c }) ?? -1
     }
 
-    // MARK: Dossier
+    // MARK: Mode dossier
 
     func setRoot(_ url: URL) {
         guard url.startAccessingSecurityScopedResource() else {
-            errorMessage = "L'accès au dossier a été refusé. Vérifie que le coffre est déverrouillé."
+            errorMessage = "L'accès au dossier a été refusé."
             return
         }
-        if let old = rootURL, old != url { old.stopAccessingSecurityScopedResource() }
+        clearAll()
         if let data = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
             UserDefaults.standard.set(data, forKey: "rootBookmark")
         }
-        errorMessage = nil
         rootURL = url
-        allPaths = []
-        items = []
-        current = nil
-        saveCache([])
         rebuildToken += 1
         rescan(known: nil)
     }
 
+    // MARK: Mode fichiers
+
+    /// Ajoute des vidéos choisies dans le sélecteur. replace = true remplace la sélection actuelle.
+    func addFiles(_ urls: [URL], replace: Bool) {
+        if replace { clearAll() }
+        var fresh: [VideoItem] = []
+        let known = Set(fileBookmarks.values)
+        for url in urls {
+            let ok = url.startAccessingSecurityScopedResource()
+            defer { if ok { url.stopAccessingSecurityScopedResource() } }
+            guard let data = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil),
+                  !known.contains(data) else { continue }
+            let id = "§" + UUID().uuidString + "/" + url.lastPathComponent
+            fileBookmarks[id] = data
+            fileURLs[id] = url
+            fresh.append(VideoItem(fileId: id, label: url.lastPathComponent))
+        }
+        fresh.sort { $0.label.localizedStandardCompare($1.label) == .orderedAscending }
+        saveBookmarks()
+        if fresh.isEmpty && !replace { return }
+        errorMessage = nil
+        if items.isEmpty || replace {
+            allItems = fresh
+            items = shuffle ? fresh.shuffled() : fresh
+            rebuildToken += 1
+        } else {
+            append(fresh)
+        }
+    }
+
+    private func clearAll() {
+        scanTask?.cancel()
+        scanning = false
+        rootURL?.stopAccessingSecurityScopedResource()
+        rootURL = nil
+        UserDefaults.standard.removeObject(forKey: "rootBookmark")
+        fileURLs = [:]
+        fileBookmarks = [:]
+        saveBookmarks()
+        allItems = []
+        items = []
+        current = nil
+        saveCache([])
+    }
+
+    func forget() {
+        clearAll()
+        rebuildToken += 1
+    }
+
+    // MARK: Restauration au lancement
+
     private func restore() {
+        // Fichiers choisis un par un
+        if let data = try? Data(contentsOf: bookmarksURL),
+           let saved = try? JSONDecoder().decode([String: Data].self, from: data), !saved.isEmpty {
+            var list: [VideoItem] = []
+            for (id, bm) in saved {
+                var stale = false
+                guard let url = try? URL(resolvingBookmarkData: bm, options: [], relativeTo: nil, bookmarkDataIsStale: &stale) else { continue }
+                fileURLs[id] = url
+                fileBookmarks[id] = bm
+                list.append(VideoItem(fileId: id, label: url.lastPathComponent))
+            }
+            list.sort { $0.label.localizedStandardCompare($1.label) == .orderedAscending }
+            allItems = list
+            items = shuffle ? list.shuffled() : list
+            return
+        }
+        // Dossier
         guard let data = UserDefaults.standard.data(forKey: "rootBookmark") else { return }
         var stale = false
         guard let url = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &stale),
@@ -72,14 +147,12 @@ final class Library: ObservableObject {
         }
         rootURL = url
         let cached = loadCache()
-        allPaths = cached
-        var list = cached.map(VideoItem.init(path:))
-        if shuffle { list.shuffle() }
-        items = list
+        allItems = cached.map(VideoItem.init(path:))
+        items = shuffle ? allItems.shuffled() : allItems
         rescan(known: Set(cached))
     }
 
-    // MARK: Analyse
+    // MARK: Analyse du dossier
 
     func rescan(known: Set<String>?) {
         scanTask?.cancel()
@@ -95,26 +168,26 @@ final class Library: ObservableObject {
                 if known?.contains(path) != true { batch.append(path) }
                 let firstOnes = self?.items.isEmpty ?? false
                 if !batch.isEmpty && (firstOnes || Date().timeIntervalSince(last) > 0.4) {
-                    self?.append(batch)
+                    self?.append(batch.map(VideoItem.init(path:)))
                     batch = []
                     last = Date()
                 }
             }
             guard let self, !Task.isCancelled else { return }
-            if !batch.isEmpty { self.append(batch) }
-            // Retire les vidéos qui n'existent plus
+            if !batch.isEmpty { self.append(batch.map(VideoItem.init(path:))) }
             let foundSet = Set(found)
             let cur = self.current
             self.items.removeAll { !foundSet.contains($0.id) && $0.id != cur }
-            self.allPaths = found
+            self.allItems = found.map(VideoItem.init(path:))
             self.saveCache(found)
             self.scanning = false
         }
     }
 
-    private func append(_ paths: [String]) {
-        allPaths += paths
-        let fresh = paths.map(VideoItem.init(path:))
+    private func append(_ incoming: [VideoItem]) {
+        let existing = Set(allItems.map(\.id))
+        let fresh = incoming.filter { !existing.contains($0.id) }
+        allItems += fresh
         if shuffle {
             if items.isEmpty {
                 items = fresh.shuffled()
@@ -131,7 +204,7 @@ final class Library: ObservableObject {
 
     func setShuffle(_ on: Bool) {
         shuffle = on
-        var list = allPaths.map(VideoItem.init(path:))
+        var list = allItems
         if on {
             list.shuffle()
             if let c = current, let i = list.firstIndex(where: { $0.id == c }) {
@@ -142,21 +215,29 @@ final class Library: ObservableObject {
         rebuildToken += 1
     }
 
-    // MARK: Cache (protégé par le chiffrement de l'iPhone)
+    // MARK: Stockage (protégé par le chiffrement de l'iPhone)
 
-    private var cacheURL: URL {
+    private var supportDir: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("index.json")
+    }
+    private var cacheURL: URL { supportDir.appendingPathComponent("index.json") }
+    private var bookmarksURL: URL { supportDir.appendingPathComponent("files.json") }
+
+    private func write(_ data: Data?, to url: URL) {
+        try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
+        try? data?.write(to: url, options: [.atomic, .completeFileProtection])
     }
 
-    private func saveCache(_ paths: [String]) {
-        try? FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? JSONEncoder().encode(paths).write(to: cacheURL, options: [.atomic, .completeFileProtection])
-    }
+    private func saveCache(_ paths: [String]) { write(try? JSONEncoder().encode(paths), to: cacheURL) }
 
     private func loadCache() -> [String] {
         guard let data = try? Data(contentsOf: cacheURL) else { return [] }
         return (try? JSONDecoder().decode([String].self, from: data)) ?? []
+    }
+
+    private func saveBookmarks() {
+        if fileBookmarks.isEmpty { try? FileManager.default.removeItem(at: bookmarksURL); return }
+        write(try? JSONEncoder().encode(fileBookmarks), to: bookmarksURL)
     }
 }
 

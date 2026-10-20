@@ -5,7 +5,7 @@ import UIKit
 struct FeedView: View {
     @EnvironmentObject var library: Library
     @EnvironmentObject var pool: PlayerPool
-    let pick: () -> Void
+    let pick: (PickAction) -> Void
 
     @State private var position: String?
     @State private var scrubbing = false
@@ -24,7 +24,7 @@ struct FeedView: View {
                         Text(library.scanning ? "Recherche des vidéos…" : "Aucune vidéo trouvée dans ce dossier.")
                             .foregroundStyle(.secondary)
                         if !library.scanning {
-                            Button("Choisir un autre dossier", action: pick)
+                            Button("Choisir d'autres vidéos") { pick(.files(replace: true)) }
                                 .buttonStyle(.borderedProminent).tint(.pink)
                         }
                     }
@@ -81,8 +81,13 @@ struct FeedView: View {
             }
         }
         .confirmationDialog("Vidéos", isPresented: $showMenu) {
-            Button("Changer de dossier", action: pick)
-            Button("Réanalyser le dossier") { library.rescan(known: Set(library.items.map(\.id))) }
+            Button("Ajouter des vidéos") { pick(.files(replace: false)) }
+            Button("Remplacer par d'autres vidéos") { pick(.files(replace: true)) }
+            Button("Choisir un dossier") { pick(.folder) }
+            if library.rootURL != nil {
+                Button("Réanalyser le dossier") { library.rescan(known: Set(library.items.map(\.id))) }
+            }
+            Button("Tout retirer", role: .destructive) { pool.reset(); library.forget() }
             Button("Annuler", role: .cancel) {}
         }
         .statusBarHidden()

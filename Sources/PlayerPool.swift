@@ -23,6 +23,7 @@ final class PlayerPool: ObservableObject {
     var scrubbing = false
 
     private var loading: Set<String> = []
+    private var scoped: [String: URL] = [:]
     private var wanted: Set<String> = []
     private var currentId: String?
     private var endObservers: [String: NSObjectProtocol] = [:]
@@ -65,6 +66,8 @@ final class PlayerPool: ObservableObject {
     private func prepare(_ id: String, url: URL) {
         guard players[id] == nil, !loading.contains(id), failed[id] == nil else { return }
         loading.insert(id)
+        // Accès au fichier choisi (sans effet pour un fichier du dossier déjà ouvert)
+        if url.startAccessingSecurityScopedResource() { scoped[id] = url }
         Task.detached(priority: .userInitiated) { [weak self] in
             // Demande au coffre de déchiffrer le fichier s'il ne l'est pas encore
             var coordError: NSError?
@@ -79,8 +82,9 @@ final class PlayerPool: ObservableObject {
 
     private func finish(_ id: String, url: URL, ok: Bool) {
         loading.remove(id)
-        guard wanted.contains(id), players[id] == nil else { return }
+        guard wanted.contains(id), players[id] == nil else { stopScope(id); return }
         guard ok else {
+            stopScope(id)
             failed[id] = "Fichier inaccessible. Le coffre est-il déverrouillé ?"
             return
         }
@@ -119,10 +123,16 @@ final class PlayerPool: ObservableObject {
         if let o = endObservers.removeValue(forKey: id) { NotificationCenter.default.removeObserver(o) }
         statusObservers.removeValue(forKey: id)?.invalidate()
         players[id] = nil
+        stopScope(id)
+    }
+
+    private func stopScope(_ id: String) {
+        scoped.removeValue(forKey: id)?.stopAccessingSecurityScopedResource()
     }
 
     func reset() {
         for id in players.keys { release(id) }
+        for id in scoped.keys { stopScope(id) }
         failed = [:]
         loading = []
         wanted = []
